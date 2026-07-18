@@ -1,73 +1,142 @@
 # LibreVoice
 
-System-wide push-to-talk voice dictation for Linux. By default, LibreVoice records while you hold the **right Ctrl** key, transcribes the audio with an OpenVINO Whisper model, and inserts the text at the current cursor.
+System-wide, local push-to-talk dictation for Linux. Hold **Right Ctrl**, speak,
+and release it; LibreVoice transcribes the utterance with OpenVINO Whisper and
+types the result into the focused application.
 
-## Ubuntu GNOME Wayland setup
+The working path is intentionally small:
 
-LibreVoice works on GNOME Wayland by listening to keyboard events with `evdev` and injecting text with `ydotool`.
+```text
+evdev hotkey -> warm microphone + pre-roll -> OpenVINO Whisper -> ydotool
+```
 
-1. Install the system tools:
+LibreVoice has been verified on Ubuntu GNOME Wayland with Firefox and VS Code.
 
-   ```bash
-   sudo apt install ydotool wl-clipboard python3-venv
-   ```
+## Requirements
 
-2. Allow your user to read keyboard input events:
+- Python 3.12 and `python3-venv`
+- `ydotool` for Wayland text injection
+- `wl-clipboard` for the clipboard fallback
+- PortAudio (`libportaudio2`) for microphone capture
+- An OpenVINO GenAI-compatible Whisper model export
+- Membership in the `input` group so `evdev` can read the global hotkey
 
-   ```bash
-   sudo usermod -aG input "$USER"
-   ```
+On Ubuntu:
 
-   Log out and back in after changing groups.
+```bash
+sudo apt install python3-venv ydotool wl-clipboard libportaudio2
+sudo usermod -aG input "$USER"
+```
 
-3. Start the `ydotool` daemon. On many Ubuntu systems this is available as a user service:
+Log out and back in after adding the group.
 
-   ```bash
-   systemctl --user enable --now ydotoold.service
-   ```
+## Setup
 
-   If that service is unavailable, start `ydotoold` using the packaging instructions for your Ubuntu release.
+Create the environment and install the tested Python dependencies:
 
-4. Run LibreVoice:
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
 
-   ```bash
-   ./run.sh
-   ```
+Place the model at:
 
-5. Hold **right Ctrl**, speak, then release **right Ctrl**. The transcribed text is also copied to the clipboard when `clipboard` is enabled.
+```text
+models/whisper-large-v3-turbo-fp16/
+```
+
+Alternatively, set `model_path` in `~/.config/librevoice/config.json` to any
+compatible local OpenVINO Whisper export.
+
+Install and start the per-user services:
+
+```bash
+./install-service.sh
+```
+
+The installer creates a stable `~/.local/bin/librevoice-daemon` symlink, so the
+checkout can live anywhere. It enables both LibreVoice and `ydotoold`; no manual
+`run.sh` invocation is needed after login.
+
+## Usage
+
+1. Focus a text field.
+2. Hold **Right Ctrl**.
+3. Speak naturally.
+4. Release **Right Ctrl** and wait for the text to appear.
+
+The tray colours show the runtime state:
+
+- Gray: ready
+- Green: recording
+- Yellow: processing speech
+- Blue: loading the model
+- Red: error
+
+GNOME's legacy XEmbed tray bridge does not expose pystray's window title as a
+hover tooltip. The icon colour and journal are the reliable status indicators
+on that desktop; dictation itself does not depend on the tray UI.
 
 ## Configuration
 
-The daemon creates `~/.config/librevoice/config.json` on first run. The defaults include:
+LibreVoice creates `~/.config/librevoice/config.json` on first run. User values
+override these defaults:
 
 ```json
 {
   "hotkey": "KEY_RIGHTCTRL",
   "mode": "hold",
-  "socket_path": "/tmp/librevoice-trigger.sock",
-  "clipboard": true
+  "model_path": "/path/to/librevoice/models/whisper-large-v3-turbo-fp16",
+  "device": "GPU",
+  "fallback_devices": ["CPU"],
+  "language": "en",
+  "max_duration_sec": 30,
+  "sample_rate": 16000,
+  "pre_roll_ms": 400,
+  "typing_delay_ms": 2,
+  "clipboard": true,
+  "notifications": true,
+  "log_level": "INFO"
 }
 ```
 
-Useful options:
+The warm microphone keeps only `pre_roll_ms` of rolling audio in memory. This
+prevents the first word from being clipped; audio is not written to disk.
 
-- `hotkey`: an `evdev.ecodes` key name, such as `KEY_RIGHTCTRL`.
-- `mode`: `hold` records while the key is held; `toggle` starts and stops on repeated presses.
-- `socket_path`: Unix socket path used by external trigger commands.
+Keep `typing_delay_ms` at `1` or higher for reliable Wayland injection. If the
+GPU model cannot load, LibreVoice tries each configured fallback device.
 
-## GNOME custom shortcut fallback
+## Service and troubleshooting
 
-GNOME custom keyboard shortcuts usually trigger commands on key press only, not key release, so they are not ideal for true hold-to-talk. If direct `evdev` hotkey listening is unavailable, set `"mode": "toggle"` and create a GNOME custom shortcut that runs:
-
-```bash
-/path/to/librevoice trigger toggle
-```
-
-Press the shortcut once to start recording and again to stop.
-
-For integrations that can send both press and release events, use:
+Check current status and follow the live processing log:
 
 ```bash
-/path/to/librevoice trigger press
-/path/to/librevoice trigger release
+systemctl --user status librevoice.service ydotoold.service
+journalctl --user -u librevoice.service -f
 ```
+
+A successful utterance logs, in order:
+
+```text
+Hotkey pressed
+Recording started with 400 ms pre-roll
+Captured ...s of audio
+Transcribed in ...s
+Injected: ...
+```
+
+If the hotkey is not logged, verify `groups` contains `input`. If transcription
+succeeds but text does not appear, check `ydotoold.service`; LibreVoice will
+restart it automatically when its socket is missing.
+
+## Development
+
+Run the headless regression suite and syntax checks with:
+
+```bash
+PYSTRAY_BACKEND=dummy .venv/bin/python3 -m unittest discover -s tests -v
+.venv/bin/python3 -m py_compile daemon.py librevoice benchmark.py
+```
+
+The tests cover Linux key transition values, microphone pre-roll, nonblocking
+clipboard behavior, and ydotoold socket reuse.

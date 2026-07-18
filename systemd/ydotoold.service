@@ -1,0 +1,14 @@
+[Unit]
+Description=ydotool daemon for LibreVoice text injection
+
+[Service]
+Type=simple
+# Remove a stale filesystem entry before binding the well-known socket. The
+# daemon otherwise appears healthy while clients silently use a lossy fallback.
+ExecStartPre=/usr/bin/rm -f /tmp/.ydotool_socket
+ExecStart=/usr/bin/ydotoold
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
