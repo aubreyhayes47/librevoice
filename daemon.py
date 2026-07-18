@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "fallback_devices": ["CPU"],
     "language": "en",
     "max_duration_sec": 30,
+    "socket_path": "/tmp/librevoice-trigger.sock",
     "sample_rate": 16000,
     "typing_delay_ms": 12,
     "clipboard": True,
@@ -681,12 +682,13 @@ class HotkeyListener:
 class SocketTriggerListener:
     """Listens for push-to-talk triggers via Unix socket."""
 
-    def __init__(self, socket_path="/tmp/librevoice-trigger.sock"):
+    def __init__(self, socket_path="/tmp/librevoice-trigger.sock", mode="hold"):
         self.socket_path = socket_path
         self._callback = None
         self._running = False
         self._server = None
         self._thread = None
+        self.mode = mode
         self._toggle_state = False  # Track state for toggle mode
 
     def set_callback(self, callback):
@@ -743,14 +745,20 @@ class SocketTriggerListener:
             try:
                 data = conn.recv(16).decode().strip()
                 conn.close()
-                # Toggle mode: each "press" flips the state
-                if data == "press":
+
+                if data == "toggle":
                     self._toggle_state = not self._toggle_state
                     if self._callback:
                         self._callback(self._toggle_state)
+                elif data == "press" and self._callback:
+                    if self.mode == "toggle":
+                        self._toggle_state = not self._toggle_state
+                        self._callback(self._toggle_state)
+                    else:
+                        self._callback(True)
                 elif data == "release" and self._callback:
-                    # Explicit release (for hold mode compatibility)
-                    self._callback(False)
+                    if self.mode == "hold":
+                        self._callback(False)
             except Exception as e:
                 logger.error(f"Socket trigger error: {e}")
 
@@ -782,7 +790,10 @@ class LibreVoiceDaemon:
             self.config["hotkey"],
             self.config["mode"],
         )
-        self.socket_listener = SocketTriggerListener()
+        self.socket_listener = SocketTriggerListener(
+            self.config["socket_path"],
+            self.config["mode"],
+        )
 
         self._is_transcribing = False
         self._lock = threading.Lock()
