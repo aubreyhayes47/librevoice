@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """LibreVoice CLI entry point."""
 
+import json
+import socket
 import sys
 from pathlib import Path
 
@@ -8,7 +10,39 @@ from pathlib import Path
 _script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_script_dir))
 
-from daemon import main
+from daemon import CONFIG_PATH, DEFAULT_CONFIG, main
+
+
+def _load_socket_path():
+    """Return the configured trigger socket path without starting the daemon."""
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH) as f:
+                config = {**DEFAULT_CONFIG, **json.load(f)}
+            return config["socket_path"]
+    except Exception:
+        pass
+    return DEFAULT_CONFIG["socket_path"]
+
+
+def trigger(action):
+    """Send a trigger action to a running LibreVoice daemon."""
+    if action not in {"press", "release", "toggle"}:
+        print("usage: librevoice trigger {press|release|toggle}", file=sys.stderr)
+        return 2
+
+    socket_path = _load_socket_path()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(action.encode())
+    except OSError as exc:
+        print(f"failed to send trigger to {socket_path}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "trigger":
+        sys.exit(trigger(sys.argv[2]))
     main()
