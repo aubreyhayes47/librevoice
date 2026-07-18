@@ -1,0 +1,7 @@
+evdev==1.9.3
+notify2==0.3.1
+numpy==2.4.6
+openvino-genai==2026.2.1.0
+Pillow==12.3.0
+pystray==0.19.5
+sounddevice==0.5.5

@@ -3,18 +3,23 @@
 
 Hold Right Ctrl → speak → release → text appears at your cursor.
 Uses OpenVINO WhisperPipeline on GPU for fast transcription.
+
+Runtime model:
+  input thread -> audio callback -> transcription worker -> text injector
+
+Input events drive recording state; audio capture and model work run off the
+desktop/UI thread because neither should make key handling lag.
 """
 
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 import evdev
@@ -28,31 +33,32 @@ from PIL import Image, ImageDraw
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path.home() / ".config" / "librevoice" / "config.json"
+PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = {
     "hotkey": "KEY_RIGHTCTRL",
     "mode": "hold",  # hold = record while held, toggle = press on/off
-    "model_path": str(
-        Path.home()
-        / "Desktop"
-        / "librevoice"
-        / "models"
-        / "whisper-large-v3-turbo-fp16"
-    ),
+    "model_path": str(PROJECT_DIR / "models" / "whisper-large-v3-turbo-fp16"),
     "device": "GPU",
     "fallback_devices": ["CPU"],
     "language": "en",
     "max_duration_sec": 30,
-    "socket_path": "/tmp/librevoice-trigger.sock",
     "sample_rate": 16000,
-    "typing_delay_ms": 12,
+    "pre_roll_ms": 400,
+    "typing_delay_ms": 2,
     "clipboard": True,
     "notifications": True,
     "log_level": "INFO",
 }
 
+# Input-event values are protocol values, not key codes.  `evdev.ecodes`
+# happens to expose KEY_DOWN/KEY_UP as *keyboard key names* (108/103), which
+# are unrelated to an event's value.  Compare against Linux's 1/0 values.
+KEY_EVENT_UP = 0
+KEY_EVENT_DOWN = 1
+
 
 def load_config():
-    """Load config, creating default if missing."""
+    """Load user overrides without losing defaults added by later releases."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
@@ -92,12 +98,15 @@ def setup_logging(level_str="INFO"):
 
 
 class AudioRecorder:
-    """Records audio from the microphone using sounddevice."""
+    """Keep a low-latency microphone stream warm between utterances."""
 
-    def __init__(self, sample_rate=16000):
+    def __init__(self, sample_rate=16000, pre_roll_ms=400):
         self.sample_rate = sample_rate
+        self.pre_roll_ms = pre_roll_ms
         self._stream = None
         self._frames = []
+        self._pre_roll_frames = deque()
+        self._pre_roll_samples = 0
         self._recording = False
         self._lock = threading.Lock()
         self._available = None
@@ -108,7 +117,6 @@ class AudioRecorder:
         try:
             import sounddevice as sd
 
-            devices = sd.query_devices()
             default_input = sd.default.device[0]
             if default_input is None:
                 self._available = False
@@ -127,28 +135,35 @@ class AudioRecorder:
             self._error_msg = str(e)
             return False
 
-    def start(self):
-        """Start recording audio."""
-        if self._recording:
-            return True
+    def warm_up(self):
+        """Open the microphone before the hotkey is pressed.
 
-        if self._available is None:
-            self.check_mic()
-        if not self._available:
-            logger.warning(f"Mic unavailable: {self._error_msg}")
+        Starting PortAudio on key-down loses its initial buffered frames on
+        many systems.  A continuously running stream lets start() prepend a
+        small pre-roll, preserving the beginning of an immediately spoken
+        word without retaining more than a fraction of a second of audio.
+        """
+        if self._stream is not None:
+            return True
+        if not self.check_mic():
+            logger.warning("Mic unavailable: %s", self._error_msg)
             return False
 
         try:
             import sounddevice as sd
 
-            self._frames = []
-            self._recording = True
-
             def callback(indata, frames, time_info, status):
                 if status:
-                    logger.warning(f"Audio status: {status}")
+                    logger.warning("Audio status: %s", status)
+                frame = indata.copy()
                 with self._lock:
-                    self._frames.append(indata.copy())
+                    self._pre_roll_frames.append(frame)
+                    self._pre_roll_samples += len(frame)
+                    max_samples = int(self.sample_rate * self.pre_roll_ms / 1000)
+                    while self._pre_roll_samples > max_samples:
+                        self._pre_roll_samples -= len(self._pre_roll_frames.popleft())
+                    if self._recording:
+                        self._frames.append(frame)
 
             self._stream = sd.InputStream(
                 samplerate=self.sample_rate,
@@ -156,32 +171,37 @@ class AudioRecorder:
                 dtype="float32",
                 callback=callback,
                 blocksize=int(self.sample_rate * 0.02),  # 20ms blocks
+                latency="low",
             )
             self._stream.start()
-            logger.info("Recording started")
+            logger.info("Microphone warmed with %d ms pre-roll", self.pre_roll_ms)
             return True
         except Exception as e:
-            self._recording = False
+            self._stream = None
             self._available = False
             self._error_msg = str(e)
-            logger.error(f"Failed to start recording: {e}")
+            logger.error("Failed to warm microphone: %s", e)
             return False
+
+    def start(self):
+        """Begin an utterance using the already-warm microphone stream."""
+        if self._recording:
+            return True
+        if not self.warm_up():
+            return False
+        with self._lock:
+            self._frames = list(self._pre_roll_frames)
+            self._recording = True
+        logger.info("Recording started with %d ms pre-roll", self.pre_roll_ms)
+        return True
 
     def stop(self):
         """Stop recording and return the audio as a numpy array."""
         if not self._recording:
             return None
 
-        self._recording = False
-        try:
-            if self._stream:
-                self._stream.stop()
-                self._stream.close()
-                self._stream = None
-        except Exception as e:
-            logger.error(f"Error stopping stream: {e}")
-
         with self._lock:
+            self._recording = False
             if not self._frames:
                 logger.warning("No audio captured")
                 return None
@@ -191,9 +211,26 @@ class AudioRecorder:
         logger.info(f"Captured {len(audio) / self.sample_rate:.2f}s of audio")
         return audio
 
+    def close(self):
+        """Release the warm stream only when the daemon exits."""
+        with self._lock:
+            self._recording = False
+            self._frames = []
+            self._pre_roll_frames.clear()
+            self._pre_roll_samples = 0
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception as e:
+                logger.warning("Error closing microphone stream: %s", e)
+            finally:
+                self._stream = None
+
     @property
     def is_recording(self):
-        return self._recording
+        with self._lock:
+            return self._recording
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +239,7 @@ class AudioRecorder:
 
 
 class Transcriber:
-    """Transcribes audio using OpenVINO WhisperPipeline."""
+    """Lazily own the expensive OpenVINO Whisper pipeline."""
 
     def __init__(self, model_path, device="GPU", fallback_devices=None):
         self.model_path = model_path
@@ -228,7 +265,11 @@ class Transcriber:
             return None
 
     def ensure_loaded(self):
-        """Ensure the model is loaded, trying fallback devices."""
+        """Ensure the model is loaded, trying fallback devices in order.
+
+        Loading is deliberately deferred so the tray can appear immediately;
+        a background preload avoids making the first dictation feel broken.
+        """
         if self._pipe is not None:
             return True
 
@@ -300,9 +341,9 @@ class Transcriber:
 
 
 class TextInjector:
-    """Injects text at the cursor position using ydotool (Wayland) or xdotool (X11)."""
+    """Inject text with the session-appropriate desktop automation backend."""
 
-    def __init__(self, clipboard=True, typing_delay_ms=12):
+    def __init__(self, clipboard=True, typing_delay_ms=2):
         self.clipboard = clipboard
         self.typing_delay_ms = typing_delay_ms
         self._session_type = os.environ.get("XDG_SESSION_TYPE", "x11")
@@ -353,7 +394,7 @@ class TextInjector:
         )
 
     def inject(self, text):
-        """Inject text at the cursor position."""
+        """Copy first, then type; the clipboard preserves a useful fallback."""
         if not text or not text.strip():
             return False
 
@@ -373,31 +414,81 @@ class TextInjector:
         """Copy text to system clipboard."""
         try:
             if self._wl_clipboard_available:
-                subprocess.run(
+                result = subprocess.run(
                     ["wl-copy"],
                     input=text.encode(),
-                    capture_output=True,
-                    timeout=15,  # Increased timeout
+                    # wl-copy forks a clipboard-serving child. Captured pipes
+                    # remain open in that child and make subprocess.run wait
+                    # until timeout even though the copy already succeeded.
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
                 )
-                logger.debug("Copied to clipboard via wl-copy")
+                if result.returncode == 0:
+                    logger.debug("Copied to clipboard via wl-copy")
+                else:
+                    logger.warning("wl-copy failed (rc=%d)", result.returncode)
             else:
                 # Fallback to xclip
-                subprocess.run(
+                result = subprocess.run(
                     ["xclip", "-selection", "clipboard"],
                     input=text.encode(),
-                    capture_output=True,
-                    timeout=15,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
                 )
-                logger.debug("Copied to clipboard via xclip")
+                if result.returncode == 0:
+                    logger.debug("Copied to clipboard via xclip")
+                else:
+                    logger.warning("xclip failed (rc=%d)", result.returncode)
         except subprocess.TimeoutExpired:
             logger.warning("Clipboard copy timed out")
         except Exception as e:
             logger.warning(f"Clipboard copy failed: {e}")
 
+    def _ensure_ydotool_backend(self):
+        """Ensure ydotoold has a connectable socket before injecting keys.
+
+        A running ydotoold process is insufficient if its /tmp socket has been
+        unlinked. In that state ydotool silently falls back to creating a new
+        virtual keyboard for each call, and compositors commonly drop its first
+        few key events while recognizing the device.
+        """
+        socket_path = Path("/tmp/.ydotool_socket")
+        if socket_path.exists():
+            return True
+
+        logger.warning("ydotoold socket missing; restarting ydotoold")
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", "ydotoold.service"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                logger.error("Could not restart ydotoold (rc=%d)", result.returncode)
+                return False
+        except Exception as e:
+            logger.error("Could not restart ydotoold: %s", e)
+            return False
+
+        # Give ydotoold and the compositor a brief moment to publish and adopt
+        # the persistent virtual keyboard before sending the first character.
+        for _ in range(20):
+            if socket_path.exists():
+                time.sleep(0.25)
+                return True
+            time.sleep(0.05)
+        logger.error("ydotoold restarted without creating its socket")
+        return False
+
     def _inject_wayland(self, text):
         """Inject text on Wayland using ydotool."""
         if not self._ydotool_available:
             logger.warning("ydotool not available for Wayland injection")
+            return False
+        if not self._ensure_ydotool_backend():
             return False
 
         try:
@@ -409,6 +500,10 @@ class TextInjector:
             if result.returncode != 0:
                 stderr = result.stderr.decode(errors="replace").strip()
                 logger.error(f"ydotool failed (rc={result.returncode}): {stderr}")
+                return False
+            stderr = result.stderr.decode(errors="replace").strip()
+            if "backend unavailable" in stderr:
+                logger.error("ydotool did not connect to ydotoold: %s", stderr)
                 return False
             logger.debug("Typed via ydotool")
             return True
@@ -467,32 +562,42 @@ class TrayIcon:
         }
         color = colors.get(state, "#808080")
 
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        # Legacy tray hosts often turn transparent/symbolic icons white.  Use
+        # an opaque coloured badge, so recording/loading/error states remain
+        # visible under GNOME's XEmbed/AppIndicator compatibility layer.
+        img = Image.new("RGBA", (64, 64), color)
         draw = ImageDraw.Draw(img)
 
-        # Draw microphone icon
-        draw.rounded_rectangle([20, 8, 44, 36], radius=12, fill=color)
-        draw.rectangle([28, 36, 36, 44], fill=color)
-        draw.arc([16, 40, 48, 64], 0, 180, fill=color, width=3)
-        draw.line([32, 52, 32, 60], fill=color, width=3)
+        # Draw a high-contrast microphone glyph.
+        glyph = "#FFFFFF"
+        draw.rounded_rectangle([20, 8, 44, 36], radius=12, fill=glyph)
+        draw.rectangle([28, 36, 36, 44], fill=glyph)
+        draw.arc([16, 40, 48, 64], 0, 180, fill=glyph, width=3)
+        draw.line([32, 52, 32, 60], fill=glyph, width=3)
 
         return img
+
+    def _label(self):
+        """Return the status text stored in the legacy tray window title."""
+        labels = {
+            # The pystray X11 backend stores titles as Latin-1 WM_NAME text,
+            # so keep these ASCII-only; an em dash crashes the whole daemon.
+            "idle": "LibreVoice - Ready (listening for Right Ctrl)",
+            "recording": "LibreVoice - Recording",
+            "transcribing": "LibreVoice - Processing speech",
+            "loading": "LibreVoice - Loading model",
+            "error": f"LibreVoice - Error: {self._error_msg[:40]}",
+        }
+        return labels.get(self._state, "LibreVoice")
 
     def start(self):
         """Start the tray icon."""
         self._running = True
 
-        def on_exit(icon, item):
-            self._running = False
-            icon.stop()
-
         self._icon = pystray.Icon(
             "librevoice",
             self._create_image("idle"),
-            "LibreVoice - Idle",
-            menu=pystray.Menu(
-                pystray.MenuItem("Quit", on_exit),
-            ),
+            self._label(),
         )
 
         # Run icon in a thread
@@ -513,17 +618,9 @@ class TrayIcon:
         self._state = state
         self._error_msg = error_msg
 
-        labels = {
-            "idle": "LibreVoice - Ready (hold Right Ctrl)",
-            "recording": "LibreVoice - Recording...",
-            "transcribing": "LibreVoice - Transcribing...",
-            "loading": "LibreVoice - Loading model...",
-            "error": f"LibreVoice - Error: {error_msg[:40]}",
-        }
-
         try:
             self._icon.icon = self._create_image(state)
-            self._icon.title = labels.get(state, "LibreVoice")
+            self._icon.title = self._label()
         except Exception as e:
             logger.error(f"Failed to update tray icon: {e}")
 
@@ -551,7 +648,7 @@ def notify(summary, message="", urgency=notify2.URGENCY_NORMAL):
 
 
 class HotkeyListener:
-    """Listens for a global hotkey using evdev."""
+    """Translate physical evdev key transitions into push-to-talk state."""
 
     def __init__(self, key_name="KEY_RIGHTCTRL", mode="hold"):
         self.key_name = key_name
@@ -562,6 +659,7 @@ class HotkeyListener:
         self._key_pressed = False
         self._toggle_state = False
         self._devices = []
+        self._threads = []
 
     def set_callback(self, callback):
         """Set the callback for key events: callback(is_pressed)."""
@@ -583,8 +681,16 @@ class HotkeyListener:
                         self.key_code in key_caps
                         and "ydotool" not in device.name.lower()
                     ):
+                        # ydotool creates a virtual keyboard.  Listening to
+                        # it would let our own text injection retrigger the
+                        # hotkey and create a feedback loop.
                         devices.append(device)
-                        logger.debug(f"Found {self.key_name} on {device.name} ({path})")
+                        logger.info(
+                            "Watching %s on %s (%s)",
+                            self.key_name,
+                            device.name,
+                            path,
+                        )
                 except (PermissionError, OSError):
                     continue
         except Exception as e:
@@ -602,8 +708,19 @@ class HotkeyListener:
 
         logger.info(f"Listening for {self.key_name} on {len(self._devices)} devices")
 
-        # Start listener thread
-        threading.Thread(target=self._listen, daemon=True).start()
+        # Give every matching input device its own blocking reader.  The
+        # previous select-based multiplexer could leave a live thread that
+        # never consumed events on some kernel/input-stack combinations.
+        self._threads = []
+        for device in self._devices:
+            thread = threading.Thread(
+                target=self._listen_device,
+                args=(device,),
+                daemon=True,
+                name=f"librevoice-input-{device.path.rsplit('/', 1)[-1]}",
+            )
+            thread.start()
+            self._threads.append(thread)
         return True
 
     def stop(self):
@@ -614,47 +731,35 @@ class HotkeyListener:
                 device.close()
             except Exception:
                 pass
+        for thread in self._threads:
+            thread.join(timeout=0.5)
+        self._threads = []
 
-    def _listen(self):
-        """Main listening loop."""
-        import select
+    def _listen_device(self, device):
+        """Read one evdev device until it disconnects or the daemon stops.
 
-        while self._running:
-            try:
-                fds = {d.fd: d for d in self._devices if d.fd >= 0}
-                if not fds:
-                    logger.error("No valid device file descriptors")
-                    time.sleep(1)
-                    self._devices = self._find_keyboard_devices()
+        read_loop() is intentionally delegated to evdev.  It owns the blocking
+        readiness details, leaving this code responsible only for translating
+        a press/release pair into the daemon's recording state.
+        """
+        try:
+            for event in device.read_loop():
+                if not self._running:
+                    return
+                if event.type != evdev.ecodes.EV_KEY or event.code != self.key_code:
                     continue
-
-                # Wait for events
-                r, _, _ = select.select(fds, [], [], 0.1)
-
-                for fd in r:
-                    device = fds.get(fd)
-                    if not device:
-                        continue
-
-                    try:
-                        for event in device.read():
-                            if event.type == evdev.ecodes.EV_KEY:
-                                if event.code == self.key_code:
-                                    if event.value == evdev.ecodes.KEY_DOWN:
-                                        logger.info("Hotkey pressed: %s", self.key_name)
-                                        self._handle_key(True)
-                                    elif event.value == evdev.ecodes.KEY_UP:
-                                        logger.info(
-                                            "Hotkey released: %s", self.key_name
-                                        )
-                                        self._handle_key(False)
-                    except (OSError, IOError):
-                        # Device disconnected, try to re-enumerate
-                        self._devices = self._find_keyboard_devices()
-                        break
-            except Exception as e:
-                logger.error(f"Listen error: {e}")
-                time.sleep(0.5)
+                if event.value == KEY_EVENT_DOWN:
+                    logger.info("Hotkey pressed: %s", self.key_name)
+                    self._handle_key(True)
+                elif event.value == KEY_EVENT_UP:
+                    logger.info("Hotkey released: %s", self.key_name)
+                    self._handle_key(False)
+        except (OSError, IOError) as e:
+            if self._running:
+                logger.warning("Input device disconnected: %s", e)
+        except Exception as e:
+            if self._running:
+                logger.exception("Input listener failed: %s", e)
 
     def _handle_key(self, is_pressed):
         """Handle a key press/release event."""
@@ -675,107 +780,20 @@ class HotkeyListener:
 
 
 # ---------------------------------------------------------------------------
-# Socket trigger listener (for external triggers like GNOME shortcuts)
-# ---------------------------------------------------------------------------
-
-
-class SocketTriggerListener:
-    """Listens for push-to-talk triggers via Unix socket."""
-
-    def __init__(self, socket_path="/tmp/librevoice-trigger.sock", mode="hold"):
-        self.socket_path = socket_path
-        self._callback = None
-        self._running = False
-        self._server = None
-        self._thread = None
-        self.mode = mode
-        self._toggle_state = False  # Track state for toggle mode
-
-    def set_callback(self, callback):
-        """Set callback for trigger events: callback(is_pressed)."""
-        self._callback = callback
-
-    def start(self):
-        """Start listening for triggers."""
-        # Clean up any existing socket
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
-
-        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server.bind(self.socket_path)
-        self._server.listen(1)
-        os.chmod(self.socket_path, 0o666)  # Allow any user to connect
-
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        logger.info(f"Socket trigger listener started on {self.socket_path}")
-        return True
-
-    def stop(self):
-        """Stop listening."""
-        self._running = False
-        if self._server:
-            try:
-                self._server.close()
-            except Exception:
-                pass
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
-        if self._thread:
-            self._thread.join(timeout=1.0)
-
-    def _run(self):
-        """Main listening loop."""
-        while self._running:
-            try:
-                self._server.settimeout(0.5)
-                conn, _ = self._server.accept()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self._running:
-                    logger.error(f"Socket accept error: {e}")
-                break
-
-            try:
-                data = conn.recv(16).decode().strip()
-                conn.close()
-
-                if data == "toggle":
-                    self._toggle_state = not self._toggle_state
-                    if self._callback:
-                        self._callback(self._toggle_state)
-                elif data == "press" and self._callback:
-                    if self.mode == "toggle":
-                        self._toggle_state = not self._toggle_state
-                        self._callback(self._toggle_state)
-                    else:
-                        self._callback(True)
-                elif data == "release" and self._callback:
-                    if self.mode == "hold":
-                        self._callback(False)
-            except Exception as e:
-                logger.error(f"Socket trigger error: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Main daemon
 # ---------------------------------------------------------------------------
 
 
 class LibreVoiceDaemon:
-    """Main daemon orchestrating all components."""
+    """Coordinate one dictation at a time across input, audio, and output."""
 
     def __init__(self):
         self.config = load_config()
         setup_logging(self.config["log_level"])
 
-        self.recorder = AudioRecorder(self.config["sample_rate"])
+        self.recorder = AudioRecorder(
+            self.config["sample_rate"], self.config["pre_roll_ms"]
+        )
         self.transcriber = Transcriber(
             self.config["model_path"],
             self.config["device"],
@@ -790,17 +808,12 @@ class LibreVoiceDaemon:
             self.config["hotkey"],
             self.config["mode"],
         )
-        self.socket_listener = SocketTriggerListener(
-            self.config["socket_path"],
-            self.config["mode"],
-        )
-
         self._is_transcribing = False
         self._lock = threading.Lock()
         self._max_duration_timer = None
 
     def _on_hotkey(self, is_pressed):
-        """Handle hotkey press/release."""
+        """Serialize key transitions so a release cannot race a new press."""
         with self._lock:
             if is_pressed:
                 self._start_recording()
@@ -841,7 +854,7 @@ class LibreVoiceDaemon:
         self._stop_recording_and_transcribe()
 
     def _stop_recording_and_transcribe(self):
-        """Stop recording and transcribe the audio."""
+        """Finish capture quickly, then move slow model work to a worker."""
         if self._max_duration_timer:
             self._max_duration_timer.cancel()
             self._max_duration_timer = None
@@ -855,6 +868,8 @@ class LibreVoiceDaemon:
         self._is_transcribing = True
 
         def do_transcribe():
+            # This worker owns all slow operations after the key is released;
+            # the input reader must remain free to catch the next transition.
             try:
                 # Ensure model is loaded
                 if not self.transcriber.ensure_loaded():
@@ -910,12 +925,9 @@ class LibreVoiceDaemon:
         """Run the daemon."""
         logger.info("LibreVoice daemon starting...")
 
-        # Start socket trigger listener (for GNOME shortcuts)
-        self.socket_listener.set_callback(self._on_hotkey)
-        self.socket_listener.start()
-
-        # Check mic
-        if not self.recorder.check_mic():
+        # Warm the stream before the hotkey is used so the first word is not
+        # clipped while PortAudio negotiates an input connection.
+        if not self.recorder.warm_up():
             msg = self.recorder._error_msg or "Microphone not available"
             logger.warning(f"Mic check failed: {msg}")
             if self.config["notifications"]:
@@ -945,6 +957,7 @@ class LibreVoiceDaemon:
 
         # Pre-load model in background
         def preload():
+            # Preload in the background so service startup stays responsive.
             self.tray.set_state("loading")
             if self.transcriber.ensure_loaded():
                 self.tray.set_state("idle")
@@ -957,7 +970,7 @@ class LibreVoiceDaemon:
         def shutdown(signum, frame):
             logger.info("Shutting down...")
             self.listener.stop()
-            self.socket_listener.stop()
+            self.recorder.close()
             self.tray.stop()
             sys.exit(0)
 
