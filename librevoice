@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""LibreVoice CLI entry point."""
+
+import sys
+from pathlib import Path
+
+# Resolve symlinks to find the actual script directory
+_script_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(_script_dir))
+
+from daemon import main
+
+if __name__ == "__main__":
+    main()
